@@ -1,7 +1,7 @@
 use std::{rc::Rc, str::FromStr};
 
 use candid::candid_method;
-use eth_rpc::call_contract;
+use eth_rpc::execute_contract_call;
 use ethers_core::{
     abi::{Contract, Token},
     types::{Address, RecoveryMessage, Signature},
@@ -13,8 +13,8 @@ mod util;
 
 // Load relevant ABIs (Ethereum equivalent of Candid interfaces)
 thread_local! {
-    static ERC_721: Rc<Contract> = Rc::new(include_abi!("../abi/erc721.json"));
-    static ERC_1155: Rc<Contract> = Rc::new(include_abi!("../abi/erc1155.json"));
+    static ERC_721: Rc<Contract> = Rc::new(load_abi!("../abi/erc721.json"));
+    static ERC_1155: Rc<Contract> = Rc::new(load_abi!("../abi/erc1155.json"));
 }
 
 /// Verify an ECDSA signature (message signed by an Ethereum wallet).
@@ -38,7 +38,7 @@ pub async fn erc721_owner_of(network: String, contract_address: String, token_id
     // TODO: cycles estimation for HTTP outcalls
 
     let abi = &ERC_721.with(Rc::clone);
-    let result = call_contract(
+    let result = execute_contract_call(
         &network,
         contract_address,
         abi,
@@ -65,7 +65,7 @@ pub async fn erc1155_balance_of(
         ethers_core::types::Address::from_str(&owner_address).expect("Invalid owner address");
 
     let abi = &ERC_1155.with(Rc::clone);
-    let result = call_contract(
+    let result = execute_contract_call(
         &network,
         contract_address,
         abi,
