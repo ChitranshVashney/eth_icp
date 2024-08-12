@@ -8,58 +8,63 @@ use std::cell::RefCell;
 
 use crate::util::{from_hex, to_hex};
 
-const HTTP_CYCLES: u128 = 100_000_000;
-const MAX_RESPONSE_BYTES: u64 = 2048;
+// Constants for HTTP call configuration
+const CYCLES_COST: u128 = 100_000_000;
+const MAX_BYTES: u64 = 2048;
 
+// Structs to define JSON-RPC requests and responses
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct JsonRpcRequest {
-    id: u64,
-    jsonrpc: String,
-    method: String,
-    params: (EthCallParams, String),
+struct RpcRequest {
+    request_id: u64,
+    version: String,
+    action: String,
+    parameters: (EthCallData, String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct EthCallParams {
-    to: String,
-    data: String,
+struct EthCallData {
+    recipient: String,
+    payload: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct JsonRpcResult {
-    result: Option<String>,
-    error: Option<JsonRpcError>,
+struct RpcResponse {
+    outcome: Option<String>,
+    rpc_error: Option<RpcErrorDetail>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct JsonRpcError {
-    code: isize,
-    message: String,
+struct RpcErrorDetail {
+    error_code: isize,
+    error_message: String,
 }
 
+// Macro to include ABI JSON files
 #[macro_export]
-macro_rules! include_abi {
+macro_rules! load_abi {
     ($file:expr $(,)?) => {{
         match serde_json::from_str::<ethers_core::abi::Contract>(include_str!($file)) {
             Ok(contract) => contract,
-            Err(err) => panic!("Error loading ABI contract {:?}: {}", $file, err),
+            Err(err) => panic!("Error loading ABI from {:?}: {}", $file, err),
         }
     }};
 }
 
-fn next_id() -> u64 {
+// Generate a unique ID for requests
+fn generate_request_id() -> u64 {
     thread_local! {
-        static NEXT_ID: RefCell<u64> = RefCell::default();
+        static REQUEST_ID: RefCell<u64> = RefCell::default();
     }
-    NEXT_ID.with(|next_id| {
-        let mut next_id = next_id.borrow_mut();
-        let id = *next_id;
-        *next_id = next_id.wrapping_add(1);
-        id
+    REQUEST_ID.with(|id| {
+        let mut id = id.borrow_mut();
+        let current_id = *id;
+        *id = id.wrapping_add(1);
+        current_id
     })
 }
 
-fn get_rpc_endpoint(network: &str) -> &'static str {
+// Function to get the RPC endpoint URL based on network name
+fn determine_rpc_url(network: &str) -> &'static str {
     match network {
         "mainnet" | "ethereum" => "https://cloudflare-eth.com/v1/mainnet",
         "goerli" => "https://ethereum-goerli.publicnode.com",
@@ -68,93 +73,107 @@ fn get_rpc_endpoint(network: &str) -> &'static str {
     }
 }
 
-/// Call an Ethereum smart contract.
-pub async fn call_contract(
+/// Perform a call to an Ethereum smart contract
+pub async fn execute_contract_call(
     network: &str,
-    contract_address: String,
-    abi: &Contract,
-    function_name: &str,
-    args: &[Token],
+    address: String,
+    contract_abi: &Contract,
+    method_name: &str,
+    arguments: &[Token],
 ) -> Vec<Token> {
-    let f = match abi.functions_by_name(function_name).map(|v| &v[..]) {
-        Ok([f]) => f,
-        Ok(fs) => panic!(
-            "Found {} function overloads. Please pass one of the following: {}",
-            fs.len(),
-            fs.iter()
-                .map(|f| format!("{:?}", f.abi_signature()))
+    // Find the function to call from the ABI
+    let function = match contract_abi.functions_by_name(method_name).map(|v| &v[..]) {
+        Ok([func]) => func,
+        Ok(overloads) => panic!(
+            "Found {} function overloads. Use one of: {}",
+            overloads.len(),
+            overloads
+                .iter()
+                .map(|func| format!("{:?}", func.abi_signature()))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Err(_) => abi
+        Err(_) => contract_abi
             .functions()
-            .find(|f| function_name == f.abi_signature())
+            .find(|func| method_name == func.abi_signature())
             .expect("Function not found"),
     };
-    let data = f
-        .encode_input(args)
-        .expect("Error while encoding input args");
-    let service_url = get_rpc_endpoint(network).to_string();
-    let json_rpc_payload = serde_json::to_string(&JsonRpcRequest {
-        id: next_id(),
-        jsonrpc: "2.0".to_string(),
-        method: "eth_call".to_string(),
-        params: (
-            EthCallParams {
-                to: contract_address,
-                data: to_hex(&data),
+    let encoded_data = function
+        .encode_input(arguments)
+        .expect("Error encoding input arguments");
+
+    // Prepare JSON-RPC payload
+    let rpc_payload = serde_json::to_string(&RpcRequest {
+        request_id: generate_request_id(),
+        version: "2.0".to_string(),
+        action: "eth_call".to_string(),
+        parameters: (
+            EthCallData {
+                recipient: address,
+                payload: to_hex(&encoded_data),
             },
             "latest".to_string(),
         ),
     })
-    .expect("Error while encoding JSON-RPC request");
+    .expect("Error encoding JSON-RPC request");
 
-    let parsed_url = url::Url::parse(&service_url).expect("Service URL parse error");
-    let host = parsed_url
-        .host_str()
-        .expect("Invalid service URL host")
-        .to_string();
+    // Parse service URL and set headers
+    let rpc_url = determine_rpc_url(network).to_string();
+    let url_parts = url::Url::parse(&rpc_url).expect("Error parsing service URL");
+    let host_header = url_parts.host_str().expect("Invalid service URL host");
 
-    let request_headers = vec![
+    let headers = vec![
         HttpHeader {
             name: "Content-Type".to_string(),
             value: "application/json".to_string(),
         },
         HttpHeader {
             name: "Host".to_string(),
-            value: host.to_string(),
+            value: host_header.to_string(),
         },
     ];
-    let request = CanisterHttpRequestArgument {
-        url: service_url,
-        max_response_bytes: Some(MAX_RESPONSE_BYTES),
+
+    // Prepare the HTTP request
+    let http_request_data = CanisterHttpRequestArgument {
+        url: rpc_url,
+        max_response_bytes: Some(MAX_BYTES),
         method: HttpMethod::POST,
-        headers: request_headers,
-        body: Some(json_rpc_payload.as_bytes().to_vec()),
-        transform: Some(TransformContext::from_name("transform".to_string(), vec![])),
-    };
-    let result = match http_request(request, HTTP_CYCLES).await {
-        Ok((r,)) => r,
-        Err((r, m)) => panic!("{:?} {:?}", r, m),
+        headers,
+        body: Some(rpc_payload.as_bytes().to_vec()),
+        transform: Some(TransformContext::from_name(
+            "handle_transform".to_string(),
+            vec![],
+        )),
     };
 
-    let json: JsonRpcResult =
-        serde_json::from_str(std::str::from_utf8(&result.body).expect("utf8"))
-            .expect("JSON was not well-formatted");
-    if let Some(err) = json.error {
-        panic!("JSON-RPC error code {}: {}", err.code, err.message);
+    // Perform the HTTP request
+    let response = match http_request(http_request_data, CYCLES_COST).await {
+        Ok((res,)) => res,
+        Err((res, msg)) => panic!("{:?} {:?}", res, msg),
+    };
+
+    // Decode the JSON-RPC response
+    let rpc_result: RpcResponse =
+        serde_json::from_str(std::str::from_utf8(&response.body).expect("Invalid UTF-8"))
+            .expect("Malformed JSON response");
+    if let Some(err) = rpc_result.rpc_error {
+        panic!(
+            "JSON-RPC error code {}: {}",
+            err.error_code, err.error_message
+        );
     }
-    let result = from_hex(&json.result.expect("Unexpected JSON response")).unwrap();
-    f.decode_output(&result).expect("Error decoding output")
+    let decoded_result = from_hex(&rpc_result.outcome.expect("Unexpected JSON response")).unwrap();
+    function
+        .decode_output(&decoded_result)
+        .expect("Error decoding output")
 }
 
-#[ic_cdk_macros::query(name = "transform")]
-pub fn transform(args: TransformArgs) -> HttpResponse {
+#[ic_cdk_macros::query(name = "handle_transform")]
+pub fn handle_transform(args: TransformArgs) -> HttpResponse {
     HttpResponse {
         status: args.response.status.clone(),
         body: args.response.body,
-        // Strip headers as they contain the Date which is not necessarily the same
-        // and will prevent consensus on the result.
+        // Remove headers that can differ and affect consensus
         headers: Vec::new(),
     }
 }
